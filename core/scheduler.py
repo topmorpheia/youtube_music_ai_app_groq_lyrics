@@ -11,9 +11,9 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .config import DEFAULT_TIMEZONE, SCHEDULE_FILE, TIKTOK_QUEUE_POLL_SECONDS, TIKTOK_SCHEDULER_ENABLED
+from .tiktok_upload import fetch_tiktok_publish_status, upload_video_to_tiktok_direct, upload_video_to_tiktok_inbox
 from .utils import read_json, write_json
 from .youtube_upload import upload_video
-from .tiktok_upload import upload_video_to_tiktok_direct, upload_video_to_tiktok_inbox
 
 
 @dataclass
@@ -29,6 +29,13 @@ _worker_thread: threading.Thread | None = None
 _worker_stop = threading.Event()
 _worker_lock = threading.Lock()
 
+TERMINAL_STATUSES = {"posted", "canceled"}
+ACTIVE_STATUSES = {"scheduled", "processing", "submitted", "error"}
+TIKTOK_PROCESSING_STATUSES = {"PROCESSING_UPLOAD", "PROCESSING_DOWNLOAD", "PROCESSING"}
+TIKTOK_SUCCESS_STATUSES = {"PUBLISH_COMPLETE", "SEND_TO_USER_INBOX"}
+TIKTOK_FAILED_STATUSES = {"FAILED"}
+MAX_HISTORY_EVENTS = 40
+
 
 def _tz() -> ZoneInfo:
     try:
@@ -39,6 +46,10 @@ def _tz() -> ZoneInfo:
 
 def _now() -> datetime:
     return datetime.now(_tz())
+
+
+def _iso_now() -> str:
+    return _now().isoformat(timespec="seconds")
 
 
 def _new_schedule_id() -> str:
@@ -59,6 +70,22 @@ def save_queue(queue_path: Path, queue: list[dict[str, Any]]) -> None:
     write_json(queue_path, queue)
 
 
+def _append_event(item: dict[str, Any], event: str, message: str, **extra: Any) -> None:
+    events = item.get("events")
+    if not isinstance(events, list):
+        events = []
+    payload = {
+        "at": _iso_now(),
+        "event": event,
+        "message": message,
+    }
+    payload.update({key: value for key, value in extra.items() if value not in (None, "")})
+    events.append(payload)
+    item["events"] = events[-MAX_HISTORY_EVENTS:]
+    item["last_event"] = message
+    item["last_event_at"] = payload["at"]
+
+
 def add_or_replace_scheduled_post(queue_path: Path, item: dict[str, Any]) -> dict[str, Any]:
     """Adiciona/atualiza um item da fila.
 
@@ -73,8 +100,32 @@ def add_or_replace_scheduled_post(queue_path: Path, item: dict[str, Any]) -> dic
     item.setdefault("schedule_id", (existing or {}).get("schedule_id") or _new_schedule_id())
     item.setdefault("status", "scheduled")
     item.setdefault("attempts", int((existing or {}).get("attempts", 0)))
-    item.setdefault("created_at", (existing or {}).get("created_at") or _now().isoformat(timespec="seconds"))
-    item["updated_at"] = _now().isoformat(timespec="seconds")
+    item.setdefault("created_at", (existing or {}).get("created_at") or _iso_now())
+    item.setdefault("events", (existing or {}).get("events") or [])
+    item["updated_at"] = _iso_now()
+    _append_event(item, "scheduled", f"Agendado para {item.get('scheduled_at') or 'sem data'}.")
+    queue.append(item)
+    save_queue(queue_path, queue)
+    return item
+
+
+def record_tiktok_submission(queue_path: Path, item: dict[str, Any], response: dict[str, Any]) -> dict[str, Any]:
+    """Registra um envio TikTok feito manualmente para aparecer no painel de status/histórico."""
+    queue = load_queue(queue_path)
+    item = dict(item)
+    item["schedule_id"] = item.get("schedule_id") or _new_schedule_id()
+    item["platform"] = "tiktok"
+    item["status"] = "submitted"
+    item["scheduled_at"] = item.get("scheduled_at") or _iso_now()
+    item["submitted_at"] = _iso_now()
+    item["publish_id"] = response.get("publish_id")
+    item["response"] = response
+    item["tiktok_status"] = "UPLOAD_SUBMITTED"
+    item["attempts"] = int(item.get("attempts") or 1)
+    item["created_at"] = item.get("created_at") or _iso_now()
+    item["updated_at"] = _iso_now()
+    item.setdefault("events", [])
+    _append_event(item, "submitted", f"Envio manual registrado. publish_id={item.get('publish_id') or 'indisponível'}.")
     queue.append(item)
     save_queue(queue_path, queue)
     return item
@@ -85,15 +136,25 @@ def cancel_scheduled_post(queue_path: Path, schedule_id: str) -> bool:
     changed = False
     for item in queue:
         if str(item.get("schedule_id")) == str(schedule_id):
-            if item.get("status") in {"scheduled", "error", "processing"}:
+            if item.get("status") in ACTIVE_STATUSES:
                 item["status"] = "canceled"
-                item["canceled_at"] = _now().isoformat(timespec="seconds")
+                item["canceled_at"] = _iso_now()
                 item["updated_at"] = item["canceled_at"]
+                _append_event(item, "canceled", "Agendamento cancelado pelo usuário.")
                 changed = True
             break
     if changed:
         save_queue(queue_path, queue)
     return changed
+
+
+def delete_scheduled_post(queue_path: Path, schedule_id: str) -> bool:
+    queue = load_queue(queue_path)
+    new_queue = [item for item in queue if str(item.get("schedule_id")) != str(schedule_id)]
+    if len(new_queue) == len(queue):
+        return False
+    save_queue(queue_path, new_queue)
+    return True
 
 
 def retry_scheduled_post(queue_path: Path, schedule_id: str) -> bool:
@@ -103,7 +164,26 @@ def retry_scheduled_post(queue_path: Path, schedule_id: str) -> bool:
         if str(item.get("schedule_id")) == str(schedule_id) and item.get("status") == "error":
             item["status"] = "scheduled"
             item.pop("error", None)
-            item["updated_at"] = _now().isoformat(timespec="seconds")
+            item["updated_at"] = _iso_now()
+            _append_event(item, "retry", "Item recolocado na fila para nova tentativa.")
+            changed = True
+            break
+    if changed:
+        save_queue(queue_path, queue)
+    return changed
+
+
+def schedule_post_now(queue_path: Path, schedule_id: str) -> bool:
+    """Move um item scheduled/error para agora, para processar manualmente."""
+    queue = load_queue(queue_path)
+    changed = False
+    for item in queue:
+        if str(item.get("schedule_id")) == str(schedule_id) and item.get("status") in {"scheduled", "error"}:
+            item["status"] = "scheduled"
+            item["scheduled_at"] = _iso_now()
+            item.pop("error", None)
+            item["updated_at"] = _iso_now()
+            _append_event(item, "manual_run", "Item movido para processamento imediato pelo usuário.")
             changed = True
             break
     if changed:
@@ -126,8 +206,9 @@ def reset_stale_processing_items(queue_path: Path, older_than_minutes: int = 120
             last_attempt = datetime.min.replace(tzinfo=_tz())
         if last_attempt <= cutoff:
             item["status"] = "scheduled"
-            item["updated_at"] = _now().isoformat(timespec="seconds")
+            item["updated_at"] = _iso_now()
             item["note"] = "Reagendado automaticamente após processamento interrompido."
+            _append_event(item, "stale_reset", "Processamento antigo foi destravado e voltou para a fila.")
             changed += 1
     if changed:
         save_queue(queue_path, queue)
@@ -189,12 +270,14 @@ class _ExclusiveFileLock:
             self.lock_path.unlink(missing_ok=True)
 
 
-def _mark_item(queue_path: Path, schedule_id: str, updates: dict[str, Any]) -> None:
+def _mark_item(queue_path: Path, schedule_id: str, updates: dict[str, Any], event: tuple[str, str] | None = None) -> None:
     queue = load_queue(queue_path)
     for item in queue:
         if str(item.get("schedule_id")) == str(schedule_id):
             item.update(updates)
-            item["updated_at"] = _now().isoformat(timespec="seconds")
+            item["updated_at"] = _iso_now()
+            if event:
+                _append_event(item, event[0], event[1])
             break
     save_queue(queue_path, queue)
 
@@ -241,6 +324,64 @@ def _publish_item(item: dict[str, Any], progress_callback: Callable[[float, str]
     raise ValueError(f"Plataforma desconhecida: {platform}")
 
 
+def _normalize_tiktok_publish_status(status_data: dict[str, Any]) -> tuple[str, str, str]:
+    status = str(status_data.get("status") or "").upper()
+    fail_reason = str(status_data.get("fail_reason") or status_data.get("fail_reason_detail") or "").strip()
+    if status in TIKTOK_SUCCESS_STATUSES:
+        return "posted", status, "TikTok confirmou a publicação/entrega."
+    if status in TIKTOK_FAILED_STATUSES:
+        suffix = f" Motivo: {fail_reason}" if fail_reason else ""
+        return "error", status, f"TikTok retornou falha no processamento.{suffix}"
+    if status in TIKTOK_PROCESSING_STATUSES or not status:
+        return "submitted", status or "AGUARDANDO_STATUS", "TikTok ainda está processando o envio."
+    return "submitted", status, f"TikTok retornou status intermediário: {status}."
+
+
+def sync_tiktok_publish_statuses(queue_path: Path = SCHEDULE_FILE) -> list[ScheduleResult]:
+    """Atualiza itens TikTok que já têm publish_id, mas ainda não chegaram a estado final."""
+    results: list[ScheduleResult] = []
+    lock_path = queue_path.with_suffix(queue_path.suffix + ".status.lock")
+    with _ExclusiveFileLock(lock_path, ttl_seconds=600) as acquired:
+        if not acquired:
+            return results
+
+        queue = load_queue(queue_path)
+        changed = False
+        for item in queue:
+            if item.get("platform") != "tiktok":
+                continue
+            if item.get("status") not in {"submitted", "processing"}:
+                continue
+            publish_id = str(item.get("publish_id") or "").strip()
+            if not publish_id:
+                continue
+            try:
+                status_data = fetch_tiktok_publish_status(publish_id, access_token=item.get("access_token") or None)
+                queue_status, tiktok_status, message = _normalize_tiktok_publish_status(status_data)
+                item["status"] = queue_status
+                item["tiktok_status"] = tiktok_status
+                item["status_response"] = status_data
+                item["last_status_checked_at"] = _iso_now()
+                if queue_status == "posted":
+                    item["posted_at"] = item.get("posted_at") or _iso_now()
+                    item.pop("error", None)
+                elif queue_status == "error":
+                    item["error"] = message
+                    item["last_error_at"] = _iso_now()
+                _append_event(item, "status_sync", message, tiktok_status=tiktok_status)
+                results.append(ScheduleResult(str(item.get("job_id") or publish_id), "tiktok", queue_status, message, status_data))
+                changed = True
+            except Exception as exc:  # noqa: BLE001
+                item["last_status_checked_at"] = _iso_now()
+                item["status_check_error"] = str(exc)
+                _append_event(item, "status_sync_error", f"Falha ao consultar status TikTok: {exc}")
+                results.append(ScheduleResult(str(item.get("job_id") or publish_id), "tiktok", "error", str(exc), None))
+                changed = True
+        if changed:
+            save_queue(queue_path, queue)
+    return results
+
+
 def process_due_posts(
     queue_path: Path = SCHEDULE_FILE,
     progress_callback: Callable[[float, str], None] | None = None,
@@ -267,25 +408,42 @@ def process_due_posts(
                 schedule_id,
                 {
                     "status": "processing",
-                    "last_attempt_at": _now().isoformat(timespec="seconds"),
+                    "last_attempt_at": _iso_now(),
                     "attempts": attempts,
                 },
+                event=("processing", f"Tentativa {attempts}: iniciando envio para {platform}."),
             )
             try:
                 response = _publish_item(item, progress_callback=progress_callback)
                 publish_id = response.get("publish_id") if isinstance(response, dict) else None
-                message = f"TikTok publish_id: {publish_id}" if platform == "tiktok" else str(response.get("url", "Publicado."))
-                _mark_item(
-                    queue_path,
-                    schedule_id,
-                    {
-                        "status": "posted",
-                        "posted_at": _now().isoformat(timespec="seconds"),
-                        "response": response,
-                        "publish_id": publish_id,
-                    },
-                )
-                results.append(ScheduleResult(job_id, platform, "posted", message, response))
+                if platform == "tiktok":
+                    _mark_item(
+                        queue_path,
+                        schedule_id,
+                        {
+                            "status": "submitted",
+                            "submitted_at": _iso_now(),
+                            "response": response,
+                            "publish_id": publish_id,
+                            "tiktok_status": "UPLOAD_SUBMITTED",
+                        },
+                        event=("submitted", f"Vídeo enviado ao TikTok. publish_id={publish_id or 'indisponível'}."),
+                    )
+                    results.append(ScheduleResult(job_id, platform, "submitted", f"TikTok recebeu o upload. publish_id: {publish_id}", response))
+                else:
+                    message = str(response.get("url", "Publicado."))
+                    _mark_item(
+                        queue_path,
+                        schedule_id,
+                        {
+                            "status": "posted",
+                            "posted_at": _iso_now(),
+                            "response": response,
+                            "publish_id": publish_id,
+                        },
+                        event=("posted", message),
+                    )
+                    results.append(ScheduleResult(job_id, platform, "posted", message, response))
             except Exception as exc:  # noqa: BLE001
                 _mark_item(
                     queue_path,
@@ -293,17 +451,30 @@ def process_due_posts(
                     {
                         "status": "error",
                         "error": str(exc),
-                        "last_error_at": _now().isoformat(timespec="seconds"),
+                        "last_error_at": _iso_now(),
                     },
+                    event=("error", str(exc)),
                 )
                 results.append(ScheduleResult(job_id, platform, "error", str(exc), None))
+
+    # Após liberar o lock de upload, já tenta atualizar status dos uploads aceitos.
+    results.extend(sync_tiktok_publish_statuses(queue_path))
+    return results
+
+
+def run_queue_maintenance(queue_path: Path = SCHEDULE_FILE) -> list[ScheduleResult]:
+    """Executa uma rodada completa: destrava itens antigos, publica vencidos e consulta status pendentes."""
+    results: list[ScheduleResult] = []
+    reset_stale_processing_items(queue_path)
+    results.extend(process_due_posts(queue_path))
+    results.extend(sync_tiktok_publish_statuses(queue_path))
     return results
 
 
 def _worker_loop(queue_path: Path, poll_seconds: int) -> None:
     while not _worker_stop.is_set():
         try:
-            process_due_posts(queue_path)
+            run_queue_maintenance(queue_path)
         except Exception:
             # Worker em background não deve derrubar o Streamlit.
             pass

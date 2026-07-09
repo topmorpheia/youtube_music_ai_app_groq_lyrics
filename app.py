@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hmac
 import os
+import shutil
 from datetime import datetime, time
 from ipaddress import ip_address, ip_network
 from pathlib import Path
@@ -29,6 +30,7 @@ from core.config import (
     SUPPORTED_AUDIO,
     SUPPORTED_IMAGES,
     SCHEDULE_FILE,
+    SCHEDULER_PING_TOKEN,
     TIKTOK_DEFAULT_PRIVACY_LEVEL,
     TIKTOK_QUEUE_POLL_SECONDS,
     TIKTOK_SCHEDULER_ENABLED,
@@ -39,13 +41,19 @@ from core.media import optimize_cover, optimize_thumbnail, optimize_vertical_cov
 from core.scheduler import (
     add_or_replace_scheduled_post,
     cancel_scheduled_post,
+    delete_scheduled_post,
     load_queue,
     process_due_posts,
+    record_tiktok_submission,
     retry_scheduled_post,
+    run_queue_maintenance,
+    schedule_post_now,
     start_tiktok_queue_worker,
+    sync_tiktok_publish_statuses,
     worker_is_running,
 )
 from core.tiktok_upload import (
+    describe_tiktok_token_source,
     fetch_tiktok_publish_status,
     query_creator_info,
     upload_video_to_tiktok_direct,
@@ -57,6 +65,35 @@ from core.youtube_upload import upload_video
 ensure_dirs(UPLOADS_DIR, OUTPUTS_DIR)
 
 st.set_page_config(page_title="YouTube Music AI", page_icon="🎵", layout="wide")
+
+st.markdown(
+    """
+    <style>
+    .ym-card {
+        border: 1px solid rgba(128,128,128,.25);
+        border-radius: 16px;
+        padding: 1rem 1.1rem;
+        background: rgba(128,128,128,.06);
+        margin-bottom: .75rem;
+    }
+    .ym-muted { opacity: .78; font-size: .92rem; }
+    .ym-badge {
+        display: inline-block;
+        padding: .18rem .55rem;
+        border-radius: 999px;
+        font-size: .78rem;
+        font-weight: 700;
+        border: 1px solid rgba(128,128,128,.25);
+        margin-right: .25rem;
+    }
+    .ym-badge-ok { background: rgba(46, 204, 113, .16); }
+    .ym-badge-warn { background: rgba(241, 196, 15, .16); }
+    .ym-badge-err { background: rgba(231, 76, 60, .16); }
+    .ym-badge-info { background: rgba(52, 152, 219, .16); }
+    </style>
+    """,
+    unsafe_allow_html=True,
+)
 
 def _tags_from_text(value: str) -> list[str]:
     return [tag.strip().strip("#") for tag in value.split(",") if tag.strip()]
@@ -89,6 +126,128 @@ def _display_path(path: Path) -> str:
         return str(path.relative_to(Path(__file__).resolve().parent))
     except ValueError:
         return str(path)
+
+
+def _path_is_inside(child: Path, parent: Path) -> bool:
+    try:
+        child.resolve().relative_to(parent.resolve())
+        return True
+    except ValueError:
+        return False
+
+
+def _resolved_existing_path(value: object) -> Path | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    path = Path(raw)
+    try:
+        return path.resolve()
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def _active_queue_refs_for_current_package(result: dict[str, object]) -> list[dict[str, object]]:
+    """Retorna itens da fila que ainda precisam dos arquivos deste pacote."""
+    job_id = _safe_str(result.get("job_id")).strip()
+    current_paths = {
+        path
+        for path in (
+            _resolved_existing_path(result.get("youtube_video")),
+            _resolved_existing_path(result.get("shorts_tiktok_video")),
+            _resolved_existing_path(result.get("manifest")),
+        )
+        if path is not None
+    }
+    active_statuses = {"scheduled", "processing", "error"}
+    refs: list[dict[str, object]] = []
+    for item in load_queue(SCHEDULE_FILE):
+        if item.get("status") not in active_statuses:
+            continue
+        item_job_id = _safe_str(item.get("job_id")).strip()
+        item_path = _resolved_existing_path(item.get("video_path"))
+        same_job = bool(job_id and item_job_id == job_id)
+        same_file = bool(item_path and item_path in current_paths)
+        if same_job or same_file:
+            refs.append(item)
+    return refs
+
+
+def _delete_current_package_files(result: dict[str, object]) -> list[str]:
+    """Apaga somente a pasta do pacote atual dentro de outputs/."""
+    deleted: list[str] = []
+    job_dir_raw = _safe_str(result.get("job_dir")).strip()
+    job_dir = Path(job_dir_raw) if job_dir_raw else None
+
+    if job_dir and job_dir.exists():
+        if not _path_is_inside(job_dir, OUTPUTS_DIR) or job_dir.resolve() == OUTPUTS_DIR.resolve():
+            raise RuntimeError(f"Caminho recusado para limpeza: {_display_path(job_dir)}")
+        shutil.rmtree(job_dir)
+        deleted.append(_display_path(job_dir))
+        return deleted
+
+    # Fallback defensivo: se a pasta do job não existir, apaga apenas arquivos conhecidos
+    # do pacote atual, desde que estejam dentro de outputs/.
+    for field in (
+        "youtube_video",
+        "shorts_tiktok_video",
+        "cover_16x9",
+        "cover_vertical_9x16",
+        "thumbnail",
+        "vertical_preview",
+        "manifest",
+    ):
+        path = Path(_safe_str(result.get(field)).strip()) if _safe_str(result.get(field)).strip() else None
+        if not path or not path.exists():
+            continue
+        if path.is_file() and _path_is_inside(path, OUTPUTS_DIR):
+            path.unlink(missing_ok=True)
+            deleted.append(_display_path(path))
+    return deleted
+
+
+def _reset_current_package_state() -> None:
+    st.session_state.result = None
+    st.session_state.pop("review_section", None)
+    st.session_state.pop("last_tiktok_publish_id", None)
+    st.session_state.pop("last_tiktok_status", None)
+    st.session_state["uploader_reset_nonce"] = int(st.session_state.get("uploader_reset_nonce", 0)) + 1
+
+
+def _render_cleanup_current_package(result: dict[str, object]) -> None:
+    st.divider()
+    st.subheader("6. Limpeza local após finalizar os envios")
+    st.caption(
+        "Use este botão depois que você terminar de enviar/agendar nas plataformas desejadas. "
+        "Ele apaga a pasta local deste pacote em `outputs/`, limpa a prévia atual e recarrega o app para começar outro envio. "
+        "Credenciais, tokens, configurações da sidebar e a fila geral não são apagados."
+    )
+
+    active_refs = _active_queue_refs_for_current_package(result)
+    if active_refs:
+        ids = ", ".join(_safe_str(item.get("schedule_id"), "sem ID") for item in active_refs[:5])
+        st.warning(
+            "Este pacote ainda tem item TikTok pendente/erro/processando na fila. "
+            "Não apague os arquivos locais antes da publicação pela fila, senão o worker não terá o vídeo para enviar. "
+            f"Itens relacionados: {ids}."
+        )
+
+    if st.button(
+        "🧹 Apagar vídeos locais deste pacote e iniciar novo envio",
+        key="cleanup_current_package_and_restart",
+        type="secondary",
+        disabled=bool(active_refs),
+    ):
+        try:
+            deleted = _delete_current_package_files(result)
+            _reset_current_package_state()
+            st.session_state["cleanup_feedback"] = (
+                "Pacote local apagado e tela recarregada para um novo envio. "
+                + (f"Itens removidos: {', '.join(deleted)}." if deleted else "Nenhum arquivo local existente foi encontrado.")
+            )
+            st.rerun()
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Não consegui limpar os arquivos locais deste pacote: {exc}")
 
 
 def _secret_or_env(name: str, default: object = "") -> object:
@@ -348,95 +507,327 @@ def _render_tiktok_status_controls(access_token: str | None = None) -> None:
             _render_tiktok_status(st.session_state["last_tiktok_status"])
 
 
+
+def _status_badge(status: object) -> str:
+    value = _safe_str(status, "?").lower()
+    labels = {
+        "scheduled": ("Agendado", "warn"),
+        "processing": ("Enviando", "info"),
+        "submitted": ("Aguardando TikTok", "info"),
+        "posted": ("Publicado/confirmado", "ok"),
+        "error": ("Erro", "err"),
+        "canceled": ("Cancelado", "warn"),
+    }
+    label, kind = labels.get(value, (value or "?", "info"))
+    return f'<span class="ym-badge ym-badge-{kind}">{label}</span>'
+
+
+def _status_label(status: object) -> str:
+    value = _safe_str(status, "?").lower()
+    return {
+        "scheduled": "⏰ Agendado",
+        "processing": "🔄 Enviando",
+        "submitted": "🛰️ Aguardando TikTok",
+        "posted": "✅ Confirmado",
+        "error": "❌ Erro",
+        "canceled": "🚫 Cancelado",
+    }.get(value, value or "?")
+
+
+def _safe_dt(value: object) -> datetime | None:
+    raw = _safe_str(value).strip()
+    if not raw:
+        return None
+    try:
+        dt = datetime.fromisoformat(raw)
+    except ValueError:
+        return None
+    if dt.tzinfo is None:
+        dt = dt.replace(tzinfo=_tz())
+    return dt
+
+
+def _human_time_delta(target: object) -> str:
+    dt = _safe_dt(target)
+    if not dt:
+        return "sem data"
+    delta = dt - _now_local()
+    seconds = int(delta.total_seconds())
+    past = seconds < 0
+    seconds = abs(seconds)
+    days, rem = divmod(seconds, 86400)
+    hours, rem = divmod(rem, 3600)
+    minutes, _ = divmod(rem, 60)
+    if days:
+        text = f"{days}d {hours}h"
+    elif hours:
+        text = f"{hours}h {minutes}min"
+    else:
+        text = f"{minutes}min"
+    return f"há {text}" if past else f"em {text}"
+
+
 def _queue_item_label(item: dict[str, object]) -> str:
     scheduled = _safe_str(item.get("scheduled_at"), "sem data")
-    status = _safe_str(item.get("status"), "?")
+    status = _status_label(item.get("status"))
     caption = _safe_str(item.get("caption"), "").replace("\n", " ")[:60]
     schedule_id = _safe_str(item.get("schedule_id"))
-    return f"{scheduled} | {status} | {caption or item.get('job_id')} | {schedule_id}"
+    return f"{status} | {scheduled} | {caption or item.get('job_id')} | {schedule_id}"
 
 
-def _queue_rows() -> list[dict[str, object]]:
+def _queue_rows(include_all: bool = True) -> list[dict[str, object]]:
     rows: list[dict[str, object]] = []
     for item in load_queue(SCHEDULE_FILE):
         if item.get("platform") != "tiktok":
             continue
+        status = _safe_str(item.get("status"), "")
+        if not include_all and status in {"posted", "canceled"}:
+            continue
+        video_path = Path(_safe_str(item.get("video_path"))) if item.get("video_path") else None
+        scheduled_at = item.get("scheduled_at", "")
         rows.append(
             {
-                "id": item.get("schedule_id", ""),
-                "status": item.get("status", ""),
-                "agendado_para": item.get("scheduled_at", ""),
-                "modo": item.get("tiktok_mode", "direct_post"),
-                "privacidade": item.get("privacy_level", ""),
+                "status": _status_label(status),
+                "agendado_para": scheduled_at,
+                "quando": _human_time_delta(scheduled_at),
+                "tiktok_status": item.get("tiktok_status", ""),
                 "tentativas": item.get("attempts", 0),
                 "publish_id": item.get("publish_id", ""),
+                "arquivo_ok": bool(video_path and video_path.exists()),
+                "última_ação": item.get("last_event", item.get("error", "")),
                 "erro": item.get("error", ""),
-                "caption": _safe_str(item.get("caption"), "")[:120],
+                "caption": _safe_str(item.get("caption"), "")[:140],
+                "id": item.get("schedule_id", ""),
             }
         )
     rows.sort(key=lambda row: str(row.get("agendado_para") or ""), reverse=False)
     return rows
 
 
-def _render_tiktok_queue_manager(expanded: bool = False) -> None:
-    with st.expander("Fila TikTok automática", expanded=expanded):
+def _queue_counts() -> dict[str, int]:
+    counts = {"scheduled": 0, "processing": 0, "submitted": 0, "posted": 0, "error": 0, "canceled": 0}
+    for item in load_queue(SCHEDULE_FILE):
+        if item.get("platform") != "tiktok":
+            continue
+        status = _safe_str(item.get("status"), "").lower()
+        counts[status] = counts.get(status, 0) + 1
+    return counts
+
+
+def _next_tiktok_due_text() -> str:
+    items = [item for item in load_queue(SCHEDULE_FILE) if item.get("platform") == "tiktok" and item.get("status") == "scheduled"]
+    dts = [(item, _safe_dt(item.get("scheduled_at"))) for item in items]
+    dts = [(item, dt) for item, dt in dts if dt]
+    if not dts:
+        return "Nenhum pendente"
+    item, dt = min(dts, key=lambda pair: pair[1])
+    return f"{dt.isoformat(timespec='minutes')} ({_human_time_delta(item.get('scheduled_at'))})"
+
+
+def _run_queue_action(label: str, action, success_empty: str = "Nada para atualizar.") -> None:  # type: ignore[no-untyped-def]
+    try:
+        results = action()
+        if not results:
+            st.info(success_empty)
+        for result in results:
+            if result.status in {"posted", "submitted"}:
+                st.success(result.message)
+                if result.response and result.response.get("publish_id"):
+                    st.session_state["last_tiktok_publish_id"] = result.response["publish_id"]
+            elif result.status == "error":
+                st.error(result.message)
+            else:
+                st.info(result.message)
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"{label}: {exc}")
+
+
+def _render_tiktok_diagnostics(access_token: str | None = None) -> None:
+    st.markdown("**Diagnóstico TikTok**")
+    try:
+        diag = describe_tiktok_token_source(access_token=access_token)
+        safe_diag = {k: v for k, v in diag.items() if "token" not in k.lower() or k in {"has_access_token", "has_refresh_token", "token_file", "token_file_exists"}}
+        st.json(safe_diag)
+        if not diag.get("client_key_configured") or not diag.get("client_secret_configured"):
+            st.warning("Client Key/Secret não estão totalmente configurados. Sem isso, refresh automático pode falhar quando o token expirar.")
+        if not diag.get("has_refresh_token"):
+            st.warning("Não encontrei refresh_token. Quando o access token expirar, será necessário gerar outro token manualmente.")
+    except Exception as exc:  # noqa: BLE001
+        st.error(f"Não consegui diagnosticar o token TikTok: {exc}")
+
+    if st.button("🧪 Testar conexão e permissões da conta TikTok", key="dashboard_test_tiktok_creator"):
+        try:
+            info = query_creator_info(access_token=access_token)
+            st.success("TikTok respondeu à consulta da conta. Confira as privacidades disponíveis abaixo.")
+            st.json(info)
+        except Exception as exc:  # noqa: BLE001
+            st.error(f"Falha no teste TikTok. Isso normalmente indica token expirado, escopo ausente ou app sem permissão: {exc}")
+
+
+def _render_tiktok_queue_manager(expanded: bool = False, access_token: str | None = None) -> None:
+    with st.expander("📡 Central TikTok: fila, status e logs", expanded=expanded):
+        worker_label = "rodando" if worker_is_running() else "parado"
         if TIKTOK_SCHEDULER_ENABLED:
-            running_text = "rodando" if worker_is_running() else "parado"
             st.caption(
-                f"Worker local: `{running_text}` | checagem a cada `{TIKTOK_QUEUE_POLL_SECONDS}s` | arquivo: `{_display_path(SCHEDULE_FILE)}`"
+                f"Worker local: `{worker_label}` | checagem a cada `{TIKTOK_QUEUE_POLL_SECONDS}s` | "
+                f"próximo pendente: `{_next_tiktok_due_text()}` | fila: `{_display_path(SCHEDULE_FILE)}`"
             )
-            if not worker_is_running():
-                if st.button("▶️ Iniciar worker da fila", key="start_tiktok_worker"):
-                    start_tiktok_queue_worker(SCHEDULE_FILE)
-                    st.rerun()
+            ping_enabled = bool(_safe_str(_secret_or_env("SCHEDULER_PING_TOKEN", SCHEDULER_PING_TOKEN)).strip())
+            if ping_enabled:
+                st.caption(
+                    "Ping externo habilitado: um monitor pode acessar a URL do app com `?queue_token=SEU_TOKEN` "
+                    "para acordar a fila, processar vencidos e consultar status sem abrir a interface."
+                )
+            else:
+                st.caption(
+                    "Dica para Streamlit Cloud: configure `SCHEDULER_PING_TOKEN` e um monitor externo para acessar "
+                    "`?queue_token=...` periodicamente. Isso reduz o risco de o app dormir no horário do TikTok."
+                )
         else:
             st.warning("TIKTOK_SCHEDULER_ENABLED=false. A fila fica salva, mas o worker automático não roda.")
 
-        rows = _queue_rows()
+        counts = _queue_counts()
+        metric_cols = st.columns(5)
+        metric_cols[0].metric("Agendados", counts.get("scheduled", 0))
+        metric_cols[1].metric("Enviando", counts.get("processing", 0))
+        metric_cols[2].metric("Aguardando TikTok", counts.get("submitted", 0))
+        metric_cols[3].metric("Confirmados", counts.get("posted", 0))
+        metric_cols[4].metric("Erros", counts.get("error", 0))
+
+        st.markdown(
+            "<div class='ym-card ym-muted'>"
+            "O app agora não marca TikTok como publicado só porque o upload foi aceito. "
+            "Ele salva o <code>publish_id</code>, consulta o status e só considera confirmado quando o TikTok retorna "
+            "<code>PUBLISH_COMPLETE</code> ou <code>SEND_TO_USER_INBOX</code>."
+            "</div>",
+            unsafe_allow_html=True,
+        )
+
+        col_a, col_b, col_c, col_d = st.columns(4)
+        with col_a:
+            if st.button("🔄 Atualizar status TikTok", key="sync_tiktok_statuses"):
+                _run_queue_action("Erro ao atualizar status", lambda: sync_tiktok_publish_statuses(SCHEDULE_FILE))
+                st.rerun()
+        with col_b:
+            if st.button("⚙️ Processar vencidos agora", key="process_tiktok_due_now"):
+                _run_queue_action("Erro ao processar fila", lambda: process_due_posts(SCHEDULE_FILE), "Não há itens vencidos.")
+                st.rerun()
+        with col_c:
+            if st.button("🩺 Rodada completa", key="run_queue_maintenance_now"):
+                _run_queue_action("Erro na manutenção", lambda: run_queue_maintenance(SCHEDULE_FILE), "Fila conferida; nada novo.")
+                st.rerun()
+        with col_d:
+            if TIKTOK_SCHEDULER_ENABLED and not worker_is_running() and st.button("▶️ Iniciar worker", key="start_tiktok_worker"):
+                start_tiktok_queue_worker(SCHEDULE_FILE)
+                st.rerun()
+
+        rows = _queue_rows(include_all=True)
         if rows:
             st.dataframe(rows, use_container_width=True, hide_index=True)
         else:
-            st.info("Nenhum agendamento TikTok na fila.")
+            st.info("Nenhum agendamento TikTok na fila ainda.")
 
-        col_q1, col_q2 = st.columns(2)
-        with col_q1:
-            if st.button("⚙️ Processar vencidos agora", key="process_tiktok_due_now"):
-                try:
-                    results = process_due_posts(SCHEDULE_FILE)
-                    if not results:
-                        st.info("Não há itens vencidos para processar agora.")
-                    for result in results:
-                        if result.status == "posted":
-                            st.success(result.message)
-                            if result.response and result.response.get("publish_id"):
-                                st.session_state["last_tiktok_publish_id"] = result.response["publish_id"]
-                        else:
-                            st.error(result.message)
-                    st.rerun()
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Erro ao processar fila: {exc}")
-        with col_q2:
-            st.caption("A fila publica via Direct Post quando o app/worker estiver rodando.")
-
-        actionable = [item for item in load_queue(SCHEDULE_FILE) if item.get("platform") == "tiktok" and item.get("status") in {"scheduled", "error", "processing"}]
-        if actionable:
-            labels = {_queue_item_label(item): str(item.get("schedule_id")) for item in actionable}
-            selected_label = st.selectbox("Gerenciar item da fila", list(labels), key="manage_tiktok_queue_item")
+        queue = [item for item in load_queue(SCHEDULE_FILE) if item.get("platform") == "tiktok"]
+        if queue:
+            labels = {_queue_item_label(item): str(item.get("schedule_id")) for item in queue}
+            selected_label = st.selectbox("Gerenciar item TikTok", list(labels), key="manage_tiktok_queue_item")
             selected_id = labels[selected_label]
-            col_m1, col_m2 = st.columns(2)
+            selected_item = next((item for item in queue if str(item.get("schedule_id")) == selected_id), {})
+            st.markdown(_status_badge(selected_item.get("status")), unsafe_allow_html=True)
+            st.caption(f"ID: `{selected_id}` | publish_id: `{selected_item.get('publish_id', '') or 'ainda não gerado'}`")
+
+            events = selected_item.get("events") if isinstance(selected_item.get("events"), list) else []
+            if events:
+                st.markdown("**Linha do tempo**")
+                for event in reversed(events[-8:]):
+                    st.caption(f"{event.get('at', '')} — {event.get('message', '')}")
+
+            col_m1, col_m2, col_m3, col_m4 = st.columns(4)
             with col_m1:
-                if st.button("Cancelar item selecionado", key="cancel_tiktok_queue_item"):
-                    if cancel_scheduled_post(SCHEDULE_FILE, selected_id):
-                        st.success("Agendamento cancelado.")
+                if selected_item.get("status") in {"scheduled", "error"} and st.button("🚀 Publicar agora", key="force_tiktok_queue_item_now"):
+                    if schedule_post_now(SCHEDULE_FILE, selected_id):
+                        _run_queue_action("Erro ao publicar agora", lambda: process_due_posts(SCHEDULE_FILE))
                         st.rerun()
-                    st.warning("Não encontrei item cancelável com esse ID.")
+                    else:
+                        st.warning("Não encontrei item publicável com esse ID.")
             with col_m2:
-                selected_item = next((item for item in actionable if str(item.get("schedule_id")) == selected_id), {})
-                if selected_item.get("status") == "error" and st.button("Tentar novamente", key="retry_tiktok_queue_item"):
+                if selected_item.get("status") == "error" and st.button("♻️ Tentar novamente", key="retry_tiktok_queue_item"):
                     if retry_scheduled_post(SCHEDULE_FILE, selected_id):
                         st.success("Item voltou para a fila.")
                         st.rerun()
-                    st.warning("Não encontrei item com erro para reprocessar.")
+                    else:
+                        st.warning("Não encontrei item com erro para reprocessar.")
+            with col_m3:
+                if selected_item.get("status") in {"scheduled", "processing", "submitted", "error"} and st.button("Cancelar", key="cancel_tiktok_queue_item"):
+                    if cancel_scheduled_post(SCHEDULE_FILE, selected_id):
+                        st.success("Agendamento cancelado.")
+                        st.rerun()
+                    else:
+                        st.warning("Não encontrei item cancelável com esse ID.")
+            with col_m4:
+                if selected_item.get("status") in {"posted", "canceled", "error"} and st.button("🗑️ Remover da lista", key="delete_tiktok_queue_item"):
+                    if delete_scheduled_post(SCHEDULE_FILE, selected_id):
+                        st.success("Item removido da fila visual.")
+                        st.rerun()
+
+            publish_id = _safe_str(selected_item.get("publish_id")).strip()
+            if publish_id and st.button("🔎 Consultar este publish_id agora", key="fetch_selected_tiktok_status"):
+                try:
+                    status_data = fetch_tiktok_publish_status(publish_id, access_token=access_token)
+                    st.session_state["last_tiktok_publish_id"] = publish_id
+                    st.session_state["last_tiktok_status"] = status_data
+                    sync_tiktok_publish_statuses(SCHEDULE_FILE)
+                    _render_tiktok_status(status_data)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Erro ao consultar status TikTok: {exc}")
+
+            with st.expander("Ver JSON completo do item selecionado", expanded=False):
+                st.json(selected_item)
+
+        with st.expander("Diagnóstico de autenticação TikTok", expanded=False):
+            _render_tiktok_diagnostics(access_token=access_token)
+
+
+def _queue_ping_requested() -> bool:
+    try:
+        token = st.query_params.get("queue_token", "")
+    except Exception:  # noqa: BLE001
+        return False
+    expected = _safe_str(_secret_or_env("SCHEDULER_PING_TOKEN", SCHEDULER_PING_TOKEN)).strip()
+    return bool(expected and token and hmac.compare_digest(_safe_str(token), expected))
+
+
+def _handle_queue_ping_if_requested() -> None:
+    if not _queue_ping_requested():
+        return
+    if TIKTOK_SCHEDULER_ENABLED:
+        start_tiktok_queue_worker(SCHEDULE_FILE)
+    results = run_queue_maintenance(SCHEDULE_FILE)
+    st.write(
+        {
+            "ok": True,
+            "processed": len(results),
+            "worker_running": worker_is_running(),
+            "checked_at": _now_local().isoformat(timespec="seconds"),
+        }
+    )
+    st.stop()
+
+
+def _maintenance_tick() -> None:
+    if not TIKTOK_SCHEDULER_ENABLED:
+        return
+    start_tiktok_queue_worker(SCHEDULE_FILE)
+    now = _now_local()
+    last_raw = st.session_state.get("last_queue_maintenance_at")
+    last_dt = _safe_dt(last_raw)
+    if last_dt and (now - last_dt).total_seconds() < max(30, min(TIKTOK_QUEUE_POLL_SECONDS, 120)):
+        return
+    st.session_state["last_queue_maintenance_at"] = now.isoformat(timespec="seconds")
+    try:
+        run_queue_maintenance(SCHEDULE_FILE)
+    except Exception as exc:  # noqa: BLE001
+        st.session_state["queue_maintenance_error"] = str(exc)
 
 
 @st.fragment
@@ -634,6 +1025,17 @@ def _render_review_sections(
                 "artist_name": result.get("artist_name", ""),
             }
 
+        def _record_manual_tiktok_submission(response: dict[str, object], mode: str) -> None:
+            try:
+                item = _build_tiktok_queue_item()
+                now_text = _now_local().isoformat(timespec="seconds")
+                item["job_id"] = f"{result.get('job_id', 'job')}-manual-{mode}-{_now_local().strftime('%H%M%S')}"
+                item["scheduled_at"] = now_text
+                item["tiktok_mode"] = mode
+                record_tiktok_submission(SCHEDULE_FILE, item, response)
+            except Exception as history_exc:  # noqa: BLE001
+                st.warning(f"Envio aceito, mas não consegui registrar no painel de histórico: {history_exc}")
+
         if tiktok_publish_at:
             st.info(
                 f"Agendamento TikTok selecionado: `{tiktok_publish_at}`. "
@@ -678,6 +1080,8 @@ def _render_review_sections(
                             progress_callback=on_progress,
                         )
                         publish_id = _save_last_tiktok_publish(response)
+                        _record_manual_tiktok_submission(response, "inbox_upload")
+                        sync_tiktok_publish_statuses(SCHEDULE_FILE)
                         st.success(f"Vídeo enviado para Inbox/Draft do TikTok. publish_id: {publish_id or response.get('publish_id')}")
                         st.info("Inbox/Draft ainda exige abrir a notificação do TikTok e concluir pelo fluxo nativo.")
                         if publish_id:
@@ -702,6 +1106,8 @@ def _render_review_sections(
                             progress_callback=on_progress,
                         )
                         publish_id = _save_last_tiktok_publish(response)
+                        _record_manual_tiktok_submission(response, "inbox_upload")
+                        sync_tiktok_publish_statuses(SCHEDULE_FILE)
                         st.success(f"Vídeo enviado para Inbox/Draft do TikTok. publish_id: {publish_id or response.get('publish_id')}")
                         st.info("No modo Inbox/Draft, finalize a publicação dentro do app/site do TikTok.")
                     else:
@@ -720,6 +1126,8 @@ def _render_review_sections(
                             progress_callback=on_progress,
                         )
                         publish_id = _save_last_tiktok_publish(response)
+                        _record_manual_tiktok_submission(response, "direct_post")
+                        sync_tiktok_publish_statuses(SCHEDULE_FILE)
                         st.success(f"TikTok recebeu a postagem. publish_id: {publish_id or response.get('publish_id')}")
                     if publish_id:
                         try:
@@ -730,7 +1138,7 @@ def _render_review_sections(
                     st.error(f"Erro no TikTok: {exc}")
 
         _render_tiktok_status_controls(access_token=tiktok_access_token or None)
-        _render_tiktok_queue_manager(expanded=bool(tiktok_publish_at))
+        st.caption("Acompanhe fila, logs e erros na Central TikTok exibida no topo do app.")
 
     elif selected_section == "Prompts de imagem":
         st.text_area("Prompt thumbnail 16:9", value=meta.get("thumbnail_prompt", ""), height=120)
@@ -738,18 +1146,29 @@ def _render_review_sections(
         st.text_area("Prompt imagem vertical 9:16", value=meta.get("cover_prompt_vertical", ""), height=120)
 
 
+_handle_queue_ping_if_requested()
+_maintenance_tick()
 _require_app_access()
-if TIKTOK_SCHEDULER_ENABLED:
-    start_tiktok_queue_worker(SCHEDULE_FILE)
 
 st.title("🎵 YouTube Music AI")
 st.caption("Gera vídeo 16:9, Shorts/TikTok 9:16, metadados por IA e publicação/agendamento.")
+cleanup_feedback = st.session_state.pop("cleanup_feedback", None)
+if cleanup_feedback:
+    st.success(cleanup_feedback)
 
 st.info(
     "Use apenas músicas, capas, thumbnails e letras que sejam suas, licenciadas ou que você tenha autorização para publicar. "
     "Se você incluir a letra na descrição, confirme que tem direito de publicar esse texto. "
     "O app otimiza metadados, mas não garante viralização."
 )
+
+queue_error = st.session_state.pop("queue_maintenance_error", None)
+if queue_error:
+    st.warning(f"A manutenção automática da fila encontrou um problema: {queue_error}")
+
+_dashboard_counts = _queue_counts()
+_dashboard_open = any(_dashboard_counts.get(key, 0) for key in ("scheduled", "processing", "submitted", "error"))
+_render_tiktok_queue_manager(expanded=_dashboard_open)
 
 sidebar_settings = _load_sidebar_settings()
 
@@ -788,24 +1207,28 @@ with st.sidebar:
         "Agendamento: YouTube/Shorts usam `publishAt`. TikTok usa fila local + Direct Post quando você selecionar data/hora."
     )
 
+uploader_reset_nonce = int(st.session_state.get("uploader_reset_nonce", 0))
+
 st.subheader("1. Envie os arquivos")
 col_a, col_b, col_c, col_d = st.columns(4)
 with col_a:
-    audio_file = st.file_uploader("Música/áudio", type=sorted([x.strip(".") for x in SUPPORTED_AUDIO]))
+    audio_file = st.file_uploader("Música/áudio", type=sorted([x.strip(".") for x in SUPPORTED_AUDIO]), key=f"audio_file_{uploader_reset_nonce}")
 with col_b:
     cover_16x9_file = st.file_uploader(
         "Imagem 16:9 para YouTube",
         type=sorted([x.strip(".") for x in SUPPORTED_IMAGES]),
         help="Se preencher só este campo, o app gera apenas o vídeo normal do YouTube.",
+        key=f"cover_16x9_file_{uploader_reset_nonce}",
     )
 with col_c:
     cover_vertical_file = st.file_uploader(
         "Imagem vertical 9:16 para Shorts/TikTok",
         type=sorted([x.strip(".") for x in SUPPORTED_IMAGES]),
         help="Se preencher só este campo, o app gera apenas o vídeo vertical para YouTube Shorts/TikTok.",
+        key=f"cover_vertical_file_{uploader_reset_nonce}",
     )
 with col_d:
-    thumbnail_file = st.file_uploader("Thumbnail YouTube opcional", type=sorted([x.strip(".") for x in SUPPORTED_IMAGES]))
+    thumbnail_file = st.file_uploader("Thumbnail YouTube opcional", type=sorted([x.strip(".") for x in SUPPORTED_IMAGES]), key=f"thumbnail_file_{uploader_reset_nonce}")
 
 st.caption(
     "Agora as imagens são realmente opcionais por formato: 16:9 gera YouTube normal; 9:16 gera Shorts/TikTok; "
@@ -867,7 +1290,7 @@ include_lyrics_in_description = st.checkbox(
     help="Quando marcado, o app anexa o texto informado no campo de letra ao final da descrição antes do upload.",
 )
 
-lyrics_txt = st.file_uploader("Arquivo .txt com a letra opcional", type=["txt"])
+lyrics_txt = st.file_uploader("Arquivo .txt com a letra opcional", type=["txt"], key=f"lyrics_txt_{uploader_reset_nonce}")
 lyrics_text = st.text_area(
     "Letra ou resumo da música",
     height=220,
@@ -1112,5 +1535,6 @@ if result:
         privacy=privacy,
         made_for_kids=made_for_kids,
     )
+    _render_cleanup_current_package(result)
 else:
     st.caption("Depois de gerar, os vídeos/imagens/metadados e opções de publicação aparecerão aqui para revisão.")

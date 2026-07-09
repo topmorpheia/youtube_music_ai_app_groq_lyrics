@@ -71,3 +71,5 @@ APP_IP_STRICT = os.getenv("APP_IP_STRICT", "true").strip().lower() in {"1", "tru
 # Fila local de agendamento TikTok via Direct Post.
 TIKTOK_SCHEDULER_ENABLED = os.getenv("TIKTOK_SCHEDULER_ENABLED", "true").strip().lower() in {"1", "true", "yes", "on"}
 TIKTOK_QUEUE_POLL_SECONDS = max(15, int(os.getenv("TIKTOK_QUEUE_POLL_SECONDS", "60")))
+# Token opcional para permitir pings externos seguros (?queue_token=...) que acordam/processam a fila no Streamlit Cloud.
+SCHEDULER_PING_TOKEN = os.getenv("SCHEDULER_PING_TOKEN", "").strip()

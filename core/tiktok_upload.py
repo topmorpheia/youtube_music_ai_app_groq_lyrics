@@ -527,3 +527,24 @@ def upload_video_to_tiktok_inbox(
         "chunk_size": chunk_size,
         "total_chunk_count": total_chunk_count,
     }
+
+
+def describe_tiktok_token_source(access_token: str | None = None) -> dict[str, Any]:
+    """Retorna um diagnóstico seguro da fonte do token, sem expor valores sensíveis."""
+    source = _resolve_token(access_token, refresh_if_needed=False)
+    token_data: dict[str, Any] = {}
+    if source.token_file:
+        token_data = _read_token_file(source.token_file)
+    expires_at = _expiry_timestamp(token_data) if token_data else None
+    return {
+        "source": source.label,
+        "explicit_override": source.explicit,
+        "has_access_token": bool(source.access_token),
+        "has_refresh_token": bool(source.refresh_token or token_data.get("refresh_token")),
+        "token_file": str(source.token_file) if source.token_file else "",
+        "token_file_exists": bool(source.token_file and source.token_file.exists()),
+        "expires_at": expires_at,
+        "expires_at_iso": token_data.get("expires_at_iso", ""),
+        "client_key_configured": bool(_client_key()),
+        "client_secret_configured": bool(_client_secret()),
+    }

@@ -433,3 +433,32 @@ SHORTS_MAX_DURATION_SECONDS=179
 VIDEO_FPS=30
 VIDEO_CRF=18
 ```
+
+## Central TikTok, fila e status
+
+A versão atual inclui uma central de status no topo do app para acompanhar cada agendamento TikTok. Ela mostra:
+
+- itens agendados, em envio, aguardando confirmação do TikTok, confirmados e com erro;
+- `publish_id` retornado pela API;
+- `tiktok_status` consultado na API oficial;
+- linha do tempo de eventos por item;
+- erro bruto quando o TikTok recusar o upload, o token estiver sem escopo ou o arquivo local tiver sido apagado;
+- ações rápidas para processar vencidos agora, atualizar status, publicar imediatamente, tentar novamente, cancelar e remover itens antigos da lista.
+
+Importante: Direct Post do TikTok não deve ser considerado publicado no momento em que o upload termina. O app agora marca o item como `submitted` / `Aguardando TikTok` e só muda para confirmado quando o status do TikTok retorna `PUBLISH_COMPLETE` ou `SEND_TO_USER_INBOX`. Se retornar `FAILED`, o item fica como erro com o motivo retornado pela plataforma.
+
+## Streamlit Cloud e agendamentos TikTok
+
+No Streamlit Cloud, o app pode dormir quando não há tráfego. Se ele estiver dormindo exatamente no horário do agendamento, a fila só será processada quando o app acordar novamente. Para reduzir esse risco, configure um token de ping nos Secrets:
+
+```toml
+SCHEDULER_PING_TOKEN = "crie-um-token-longo-e-aleatorio"
+```
+
+Depois crie um monitor externo, como UptimeRobot, Better Stack ou cron externo, chamando periodicamente:
+
+```text
+https://SEU-APP.streamlit.app/?queue_token=crie-um-token-longo-e-aleatorio
+```
+
+Esse ping não abre a interface: ele só executa uma rodada segura de manutenção da fila, processa itens vencidos e consulta status pendentes.

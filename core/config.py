@@ -51,6 +51,7 @@ SHORTS_MAX_DURATION_SECONDS = float(os.getenv("SHORTS_MAX_DURATION_SECONDS", "17
 # O app procura o token nesta ordem: override na tela, .env e arquivos JSON em credentials/.
 TIKTOK_ACCESS_TOKEN = os.getenv("TIKTOK_ACCESS_TOKEN", "").strip()
 TIKTOK_REFRESH_TOKEN = os.getenv("TIKTOK_REFRESH_TOKEN", "").strip()
+TIKTOK_OPEN_ID = os.getenv("TIKTOK_OPEN_ID", "").strip()
 TIKTOK_CLIENT_KEY = (os.getenv("TIKTOK_CLIENT_KEY") or os.getenv("TIKTOK_CLIENT_ID") or "").strip()
 TIKTOK_CLIENT_SECRET = os.getenv("TIKTOK_CLIENT_SECRET", "").strip()
 TIKTOK_TOKEN_FILE = Path(os.getenv("TIKTOK_TOKEN_FILE", str(CREDENTIALS_DIR / ".tiktok_token.json")))

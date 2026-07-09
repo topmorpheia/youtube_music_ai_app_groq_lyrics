@@ -17,6 +17,7 @@ from .config import (
     TIKTOK_ACCESS_TOKEN,
     TIKTOK_CLIENT_KEY,
     TIKTOK_CLIENT_SECRET,
+    TIKTOK_OPEN_ID,
     TIKTOK_REFRESH_TOKEN,
     TIKTOK_TOKEN_FILE,
 )
@@ -27,6 +28,7 @@ INBOX_UPLOAD_ENDPOINT = f"{TIKTOK_API_BASE}/v2/post/publish/inbox/video/init/"
 CREATOR_INFO_ENDPOINT = f"{TIKTOK_API_BASE}/v2/post/publish/creator_info/query/"
 STATUS_FETCH_ENDPOINT = f"{TIKTOK_API_BASE}/v2/post/publish/status/fetch/"
 TOKEN_ENDPOINT = f"{TIKTOK_API_BASE}/v2/oauth/token/"
+LEGACY_SHARE_VIDEO_ENDPOINT = "https://open-api.tiktok.com/share/video/upload/"
 
 MIN_CHUNK_SIZE = 5_000_000
 MAX_CHUNK_SIZE = 64_000_000
@@ -249,6 +251,28 @@ def _resolve_token(access_token: str | None = None, *, refresh_if_needed: bool =
 
 def _get_access_token(access_token: str | None = None) -> str:
     return _resolve_token(access_token).access_token
+
+
+def _resolve_legacy_open_id(open_id: str | None = None) -> str:
+    """Resolve o open_id exigido pela Share Video API legada."""
+    explicit = (open_id or "").strip()
+    if explicit:
+        return explicit
+
+    env_open_id = (os.getenv("TIKTOK_OPEN_ID") or TIKTOK_OPEN_ID or "").strip()
+    if env_open_id:
+        return env_open_id
+
+    for token_file in _candidate_token_files():
+        token_data = _read_token_file(token_file)
+        file_open_id = str(token_data.get("open_id") or token_data.get("openid") or "").strip()
+        if file_open_id:
+            return file_open_id
+
+    raise TikTokUploadError(
+        "TikTok open_id não configurado. A API legada Share Video exige open_id + access_token. "
+        "Adicione TIKTOK_OPEN_ID nos Secrets/.env ou gere o token com `python tiktok_oauth_setup.py`."
+    )
 
 
 def _headers(access_token: str) -> dict[str, str]:
@@ -536,6 +560,83 @@ def upload_video_to_tiktok_inbox(
     }
 
 
+def upload_video_to_tiktok_legacy_share(
+    video_path: Path,
+    access_token: str | None = None,
+    open_id: str | None = None,
+    progress_callback: Callable[[float, str], None] | None = None,
+) -> dict[str, Any]:
+    """Tenta usar a Share Video API legada/descontinuada.
+
+    Endpoint legado: https://open-api.tiktok.com/share/video/upload/
+    Ele envia o vídeo para a Inbox do usuário e retorna um share_id quando aceito.
+    A API foi descontinuada pelo TikTok; mantenha apenas como teste experimental.
+    """
+    video_path = Path(video_path)
+    if not video_path.exists():
+        raise FileNotFoundError(f"Vídeo não encontrado: {video_path}")
+
+    video_size = video_path.stat().st_size
+    if video_size <= 0:
+        raise TikTokUploadError("Arquivo de vídeo vazio.")
+    if video_size > 50 * 1024 * 1024:
+        raise TikTokUploadError(
+            "A Share Video API legada aceita vídeos de até 50 MB. "
+            f"Arquivo atual: {video_size / 1024 / 1024:.1f} MB. Use o modo Inbox/Draft oficial."
+        )
+
+    token = _get_access_token(access_token)
+    resolved_open_id = _resolve_legacy_open_id(open_id)
+
+    if progress_callback:
+        progress_callback(0.05, "Inicializando teste na Share Video API legada...")
+
+    params = {"access_token": token, "open_id": resolved_open_id}
+    try:
+        with video_path.open("rb") as video_file:
+            files = {"video": (video_path.name, video_file, "video/mp4")}
+            response = requests.post(
+                LEGACY_SHARE_VIDEO_ENDPOINT,
+                params=params,
+                files=files,
+                timeout=300,
+            )
+    except requests.RequestException as exc:
+        raise TikTokUploadError(f"Falha de rede na Share Video API legada: {exc}") from exc
+
+    if progress_callback:
+        progress_callback(0.95, "Resposta recebida da API legada...")
+
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise TikTokUploadError(
+            f"Resposta não-JSON da Share Video API legada: HTTP {response.status_code} {response.text[:1000]}"
+        ) from exc
+
+    data = payload.get("data") or {}
+    extra = payload.get("extra") or {}
+    err_code = data.get("error_code", data.get("err_code", 0))
+    if response.status_code >= 400 or err_code not in (0, "0", None):
+        message = data.get("error_msg") or extra.get("error_detail") or payload.get("message") or "erro desconhecido"
+        log_id = extra.get("logid") or extra.get("log_id") or ""
+        suffix = f" | log_id={log_id}" if log_id else ""
+        raise TikTokUploadError(
+            f"Share Video API legada falhou: HTTP {response.status_code}, código={err_code}, {message}{suffix}"
+        )
+
+    if progress_callback:
+        progress_callback(1.0, "API legada aceitou o vídeo.")
+
+    return {
+        "share_id": data.get("share_id") or data.get("shareId"),
+        "raw_response": payload,
+        "mode": "legacy_share_video_api",
+        "video_size": video_size,
+        "caption_delivery": "not_supported_by_legacy_share_video_api",
+    }
+
+
 def describe_tiktok_token_source(access_token: str | None = None) -> dict[str, Any]:
     """Retorna um diagnóstico seguro da fonte do token, sem expor valores sensíveis."""
     source = _resolve_token(access_token, refresh_if_needed=False)
@@ -548,6 +649,7 @@ def describe_tiktok_token_source(access_token: str | None = None) -> dict[str, A
         "explicit_override": source.explicit,
         "has_access_token": bool(source.access_token),
         "has_refresh_token": bool(source.refresh_token or token_data.get("refresh_token")),
+        "has_open_id": bool((os.getenv("TIKTOK_OPEN_ID") or TIKTOK_OPEN_ID or token_data.get("open_id") or token_data.get("openid") or "").strip()),
         "token_file": str(source.token_file) if source.token_file else "",
         "token_file_exists": bool(source.token_file and source.token_file.exists()),
         "expires_at": expires_at,

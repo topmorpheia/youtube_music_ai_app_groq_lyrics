@@ -336,3 +336,16 @@ https://SEU-APP.streamlit.app/?queue_token=crie-um-token-longo-e-aleatorio
 ```
 
 Esse ping não abre a interface: ele só executa uma rodada segura de manutenção da fila, processa itens vencidos e consulta status pendentes.
+
+### Teste experimental da Share Video API legada
+
+A seção TikTok também inclui um expander opcional **“Teste experimental: Share Video API legada/descontinuada”**. Ele chama o endpoint antigo `https://open-api.tiktok.com/share/video/upload/`, que o próprio TikTok marcou como descontinuado. Use apenas para teste.
+
+Limitações desse modo legado:
+
+- exige `access_token` e `open_id` do usuário TikTok;
+- aceita apenas MP4 de até 50 MB;
+- não possui campo oficial de caption/descrição;
+- pode falhar porque o endpoint foi descontinuado pelo TikTok.
+
+Para testar, deixe `TIKTOK_OPEN_ID` nos Secrets/.env ou garanta que `credentials/.tiktok_token.json` tenha o campo `open_id`.

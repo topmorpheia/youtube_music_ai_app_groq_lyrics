@@ -57,6 +57,7 @@ from core.tiktok_upload import (
     fetch_tiktok_publish_status,
     query_creator_info,
     upload_video_to_tiktok_inbox,
+    upload_video_to_tiktok_legacy_share,
 )
 from core.utils import ensure_dirs, media_duration_seconds, new_job_id, read_json, save_uploaded_file, write_json
 from core.youtube_upload import upload_video
@@ -1086,6 +1087,61 @@ def _render_review_sections(
                         st.warning(f"Upload aceito, mas não consegui consultar o status agora: {status_exc}")
             except Exception as exc:  # noqa: BLE001
                 st.error(f"Erro no TikTok Inbox/Draft: {exc}")
+
+        with st.expander("🧪 Teste experimental: Share Video API legada/descontinuada", expanded=False):
+            st.warning(
+                "Este teste usa o endpoint antigo `open-api.tiktok.com/share/video/upload/`, que o próprio TikTok marcou como "
+                "descontinuado. Pode falhar mesmo com token correto. Mantive aqui só para teste, sem substituir o Inbox/Draft oficial."
+            )
+            st.caption(
+                "Limitações conhecidas do modo legado: exige `open_id` além do access token, aceita vídeo MP4 de até 50 MB e "
+                "não possui campo oficial de caption/descrição. Se aceitar o vídeo, ele também deve aparecer na Inbox do TikTok."
+            )
+            legacy_open_id = st.text_input(
+                "TikTok open_id opcional para o teste legado",
+                value="",
+                type="password",
+                help="Normalmente deixe vazio se o token JSON salvo já tiver open_id. Use este campo só para teste temporário.",
+                key="tiktok_legacy_open_id_override",
+            )
+            legacy_confirm = st.checkbox(
+                "Entendi que esta API foi descontinuada e quero testar mesmo assim",
+                value=False,
+                key="confirm_legacy_share_api_test",
+            )
+            if st.button("🧪 Testar envio pela Share Video API legada", key="send_tiktok_legacy_share", disabled=not legacy_confirm):
+                legacy_progress = st.progress(0, text="Testando API legada do TikTok...")
+
+                def on_legacy_progress(value: float, label: str) -> None:
+                    legacy_progress.progress(min(1.0, max(0.0, value)), text=label)
+
+                try:
+                    legacy_response = upload_video_to_tiktok_legacy_share(
+                        video_path=vertical_video_path,
+                        access_token=tiktok_access_token or None,
+                        open_id=legacy_open_id or None,
+                        progress_callback=on_legacy_progress,
+                    )
+                    legacy_item = _build_tiktok_history_item()
+                    legacy_item["job_id"] = f"{result.get('job_id', 'job')}-legacy-share-{_now_local().strftime('%H%M%S')}"
+                    legacy_item["tiktok_mode"] = "legacy_share_video_api"
+                    legacy_item["caption_delivery"] = "not_supported_by_legacy_share_video_api"
+                    try:
+                        record_tiktok_submission(SCHEDULE_FILE, legacy_item, legacy_response)
+                    except Exception as history_exc:  # noqa: BLE001
+                        st.warning(f"Envio aceito, mas não consegui registrar no histórico: {history_exc}")
+                    st.success(f"API legada aceitou o vídeo. share_id: {legacy_response.get('share_id') or 'indisponível'}")
+                    st.info(
+                        "Confira a Inbox/Caixa de entrada do TikTok. Se aparecer texto padrão como `#tiktokuploadtest`, "
+                        "a API legada também não aceitou caption; use a legenda pronta acima para substituir."
+                    )
+                    st.json(legacy_response)
+                except Exception as exc:  # noqa: BLE001
+                    st.error(f"Teste da Share Video API legada falhou: {exc}")
+                    st.info(
+                        "Se falhar por endpoint descontinuado, permissão, open_id ou limite do vídeo, o caminho está bloqueado pelo TikTok. "
+                        "Nesse caso, continue usando Inbox/Draft oficial."
+                    )
         st.caption("Acompanhe fila, logs e erros na Central TikTok exibida no topo do app.")
 
     elif selected_section == "Prompts de imagem":

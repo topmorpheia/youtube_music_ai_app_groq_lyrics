@@ -56,7 +56,6 @@ from core.tiktok_upload import (
     describe_tiktok_token_source,
     fetch_tiktok_publish_status,
     query_creator_info,
-    upload_video_to_tiktok_direct,
     upload_video_to_tiktok_inbox,
 )
 from core.utils import ensure_dirs, media_duration_seconds, new_job_id, read_json, save_uploaded_file, write_json
@@ -954,8 +953,8 @@ def _render_review_sections(
         vertical_video_path = Path(result["shorts_tiktok_video"])
         st.warning(
             "A API oficial do TikTok usa User Access Token OAuth. "
-            "Para publicar direto, o token precisa de `video.publish`; para enviar para Inbox/Draft, precisa de `video.upload`. "
-            "Client Key sozinho não publica; rode `python tiktok_oauth_setup.py` para gerar/salvar o token."
+            "Nesta versão, a seção TikTok usa somente Inbox/Draft, então o token precisa do escopo `video.upload`. "
+            "Client Key sozinho não envia vídeo; rode `python tiktok_oauth_setup.py` para gerar/salvar o token."
         )
         st.caption(
             "Token automático: se este campo ficar vazio, o app usa `TIKTOK_ACCESS_TOKEN` do `.env` "
@@ -998,18 +997,33 @@ def _render_review_sections(
         is_aigc = st.checkbox("Marcar como conteúdo gerado por IA no TikTok", value=bool(meta.get("tiktok_is_aigc", False)), key="tiktok_is_aigc")
 
         tiktok_publish_at = target_publish_at
-        tiktok_mode = st.selectbox("Modo de envio TikTok", ["direct_post", "inbox_upload"], index=0, key="tiktok_mode")
+        st.markdown("**Modo TikTok ativo: Inbox/Draft**")
         st.caption(
-            "`direct_post` publica direto usando `video.publish`. `inbox_upload` envia para Inbox/Draft usando `video.upload` e ainda exige confirmação manual."
+            "Removi o Direct Post/agendamento automático desta tela. Agora o app usa somente o envio oficial para "
+            "Inbox/Draft do TikTok (`video.upload`), para você finalizar ou agendar dentro do fluxo nativo do TikTok."
         )
+        st.warning(
+            "Importante: a API oficial de Inbox/Draft do TikTok não aceita caption/descrição no payload de upload. "
+            "Por isso o TikTok pode exibir uma hashtag padrão do app, como `#tiktokuploadtest`, na tela inicial. "
+            "O app não envia essa hashtag. A legenda correta fica pronta abaixo para copiar/colar ao concluir o post no TikTok."
+        )
+        caption_file_name = f"caption_tiktok_{result.get('job_id', 'video')}.txt"
+        st.download_button(
+            "⬇️ Baixar legenda TikTok pronta",
+            data=tiktok_caption.encode("utf-8"),
+            file_name=caption_file_name,
+            mime="text/plain",
+            key="download_tiktok_caption_txt",
+        )
+        with st.expander("Ver legenda pronta para copiar", expanded=True):
+            st.code(tiktok_caption, language="text")
+            st.caption(f"{len(tiktok_caption)} caracteres. Use esta legenda no TikTok ao abrir a notificação da Inbox/Draft.")
 
-        def _build_tiktok_queue_item() -> dict[str, object]:
-            # Por segurança, não gravamos o token digitado na tela na fila. Para agendamento,
-            # deixe o token persistido no .env ou em credentials/.tiktok_token.json.
+        def _build_tiktok_history_item() -> dict[str, object]:
             return {
                 "job_id": result.get("job_id", ""),
                 "platform": "tiktok",
-                "scheduled_at": tiktok_publish_at,
+                "scheduled_at": _now_local().isoformat(timespec="seconds"),
                 "video_path": str(vertical_video_path),
                 "caption": tiktok_caption,
                 "privacy_level": tiktok_privacy,
@@ -1020,124 +1034,58 @@ def _render_review_sections(
                 "brand_content_toggle": bool(brand_content),
                 "brand_organic_toggle": bool(brand_organic),
                 "is_aigc": bool(is_aigc),
-                "tiktok_mode": "direct_post",
+                "tiktok_mode": "inbox_upload",
                 "song_title": result.get("song_title", ""),
                 "artist_name": result.get("artist_name", ""),
+                "caption_delivery": "manual_copy_required_by_tiktok_inbox_api",
             }
 
-        def _record_manual_tiktok_submission(response: dict[str, object], mode: str) -> None:
+        def _record_manual_tiktok_submission(response: dict[str, object]) -> None:
             try:
-                item = _build_tiktok_queue_item()
-                now_text = _now_local().isoformat(timespec="seconds")
-                item["job_id"] = f"{result.get('job_id', 'job')}-manual-{mode}-{_now_local().strftime('%H%M%S')}"
-                item["scheduled_at"] = now_text
-                item["tiktok_mode"] = mode
+                item = _build_tiktok_history_item()
+                item["job_id"] = f"{result.get('job_id', 'job')}-manual-inbox-{_now_local().strftime('%H%M%S')}"
                 record_tiktok_submission(SCHEDULE_FILE, item, response)
             except Exception as history_exc:  # noqa: BLE001
                 st.warning(f"Envio aceito, mas não consegui registrar no painel de histórico: {history_exc}")
 
         if tiktok_publish_at:
             st.info(
-                f"Agendamento TikTok selecionado: `{tiktok_publish_at}`. "
-                "A opção automática abaixo salva este vídeo em uma fila local e publica via Direct Post quando chegar o horário."
+                f"Horário selecionado como referência: `{tiktok_publish_at}`. "
+                "No modo Inbox/Draft, o TikTok não agenda pela API: ele envia a notificação para você abrir no TikTok, "
+                "colar/conferir a legenda e escolher o agendamento nativo por lá."
             )
-            if tiktok_access_token.strip():
-                st.warning(
-                    "O token digitado na tela não será salvo na fila por segurança. "
-                    "Para o agendamento automático funcionar, salve o token no `.env` ou em `credentials/.tiktok_token.json`."
+
+        button_label = "📨 Enviar para TikTok Inbox/Draft"
+        if tiktok_publish_at:
+            button_label = "📨 Enviar para Inbox/Draft e agendar no TikTok"
+        if st.button(button_label, key="send_tiktok_inbox_only"):
+            upload_progress = st.progress(0, text="Enviando para TikTok Inbox/Draft...")
+
+            def on_progress(value: float, label: str) -> None:
+                upload_progress.progress(min(1.0, max(0.0, value)), text=label)
+
+            try:
+                response = upload_video_to_tiktok_inbox(
+                    video_path=vertical_video_path,
+                    access_token=tiktok_access_token or None,
+                    caption=tiktok_caption,
+                    progress_callback=on_progress,
                 )
-            if tiktok_mode != "direct_post":
-                st.warning("Agendamento automático sem celular só funciona com Direct Post. Inbox/Draft continua manual.")
-
-            col_sched_t1, col_sched_t2 = st.columns(2)
-            with col_sched_t1:
-                if st.button("📅 Agendar publicação automática via fila", key="schedule_tiktok_direct_queue", disabled=tiktok_mode != "direct_post"):
+                publish_id = _save_last_tiktok_publish(response)
+                _record_manual_tiktok_submission(response)
+                sync_tiktok_publish_statuses(SCHEDULE_FILE)
+                st.success(f"Vídeo enviado para Inbox/Draft do TikTok. publish_id: {publish_id or response.get('publish_id')}")
+                st.info(
+                    "Abra a notificação/Caixa de entrada do TikTok para concluir. A legenda correta está acima para copiar; "
+                    "se o TikTok mostrar `#tiktokuploadtest`, substitua pela legenda gerada pela IA."
+                )
+                if publish_id:
                     try:
-                        scheduled_item = add_or_replace_scheduled_post(SCHEDULE_FILE, _build_tiktok_queue_item())
-                        if TIKTOK_SCHEDULER_ENABLED:
-                            start_tiktok_queue_worker(SCHEDULE_FILE)
-                        st.success(
-                            "Agendamento TikTok salvo na fila. "
-                            f"ID: `{scheduled_item.get('schedule_id')}` | horário: `{scheduled_item.get('scheduled_at')}`"
-                        )
-                        st.info(
-                            "Mantenha o app rodando no Streamlit/servidor no horário agendado. "
-                            "Se o servidor estiver dormindo/desligado, o item será processado quando o app voltar a rodar."
-                        )
-                    except Exception as exc:  # noqa: BLE001
-                        st.error(f"Erro ao salvar agendamento TikTok: {exc}")
-            with col_sched_t2:
-                if st.button("📨 Enviar para Inbox/Draft agora", key="send_tiktok_inbox_for_native_schedule"):
-                    upload_progress = st.progress(0, text="Enviando para TikTok Inbox/Draft...")
-
-                    def on_progress(value: float, label: str) -> None:
-                        upload_progress.progress(min(1.0, max(0.0, value)), text=label)
-
-                    try:
-                        response = upload_video_to_tiktok_inbox(
-                            video_path=vertical_video_path,
-                            access_token=tiktok_access_token or None,
-                            progress_callback=on_progress,
-                        )
-                        publish_id = _save_last_tiktok_publish(response)
-                        _record_manual_tiktok_submission(response, "inbox_upload")
-                        sync_tiktok_publish_statuses(SCHEDULE_FILE)
-                        st.success(f"Vídeo enviado para Inbox/Draft do TikTok. publish_id: {publish_id or response.get('publish_id')}")
-                        st.info("Inbox/Draft ainda exige abrir a notificação do TikTok e concluir pelo fluxo nativo.")
-                        if publish_id:
-                            try:
-                                _fetch_and_render_tiktok_status(publish_id, access_token=tiktok_access_token or None)
-                            except Exception as status_exc:  # noqa: BLE001
-                                st.warning(f"Upload aceito, mas não consegui consultar o status agora: {status_exc}")
-                    except Exception as exc:  # noqa: BLE001
-                        st.error(f"Erro no TikTok Inbox/Draft: {exc}")
-        else:
-            if st.button("🎵 Postar/enviar agora para TikTok", key="post_tiktok_now"):
-                upload_progress = st.progress(0, text="Iniciando TikTok...")
-
-                def on_progress(value: float, label: str) -> None:
-                    upload_progress.progress(min(1.0, max(0.0, value)), text=label)
-
-                try:
-                    if tiktok_mode == "inbox_upload":
-                        response = upload_video_to_tiktok_inbox(
-                            video_path=vertical_video_path,
-                            access_token=tiktok_access_token or None,
-                            progress_callback=on_progress,
-                        )
-                        publish_id = _save_last_tiktok_publish(response)
-                        _record_manual_tiktok_submission(response, "inbox_upload")
-                        sync_tiktok_publish_statuses(SCHEDULE_FILE)
-                        st.success(f"Vídeo enviado para Inbox/Draft do TikTok. publish_id: {publish_id or response.get('publish_id')}")
-                        st.info("No modo Inbox/Draft, finalize a publicação dentro do app/site do TikTok.")
-                    else:
-                        response = upload_video_to_tiktok_direct(
-                            video_path=vertical_video_path,
-                            caption=tiktok_caption,
-                            privacy_level=tiktok_privacy,
-                            disable_duet=disable_duet,
-                            disable_stitch=disable_stitch,
-                            disable_comment=disable_comment,
-                            video_cover_timestamp_ms=int(cover_ts),
-                            brand_content_toggle=brand_content,
-                            brand_organic_toggle=brand_organic,
-                            is_aigc=is_aigc,
-                            access_token=tiktok_access_token or None,
-                            progress_callback=on_progress,
-                        )
-                        publish_id = _save_last_tiktok_publish(response)
-                        _record_manual_tiktok_submission(response, "direct_post")
-                        sync_tiktok_publish_statuses(SCHEDULE_FILE)
-                        st.success(f"TikTok recebeu a postagem. publish_id: {publish_id or response.get('publish_id')}")
-                    if publish_id:
-                        try:
-                            _fetch_and_render_tiktok_status(publish_id, access_token=tiktok_access_token or None)
-                        except Exception as status_exc:  # noqa: BLE001
-                            st.warning(f"Envio aceito, mas não consegui consultar o status agora: {status_exc}")
-                except Exception as exc:  # noqa: BLE001
-                    st.error(f"Erro no TikTok: {exc}")
-
-        _render_tiktok_status_controls(access_token=tiktok_access_token or None)
+                        _fetch_and_render_tiktok_status(publish_id, access_token=tiktok_access_token or None)
+                    except Exception as status_exc:  # noqa: BLE001
+                        st.warning(f"Upload aceito, mas não consegui consultar o status agora: {status_exc}")
+            except Exception as exc:  # noqa: BLE001
+                st.error(f"Erro no TikTok Inbox/Draft: {exc}")
         st.caption("Acompanhe fila, logs e erros na Central TikTok exibida no topo do app.")
 
     elif selected_section == "Prompts de imagem":
@@ -1204,7 +1152,7 @@ with st.sidebar:
         "para ficar abaixo do teto de Shorts e evitar erro por arredondamento de duração."
     )
     st.caption(
-        "Agendamento: YouTube/Shorts usam `publishAt`. TikTok usa fila local + Direct Post quando você selecionar data/hora."
+        "Agendamento: YouTube/Shorts usam `publishAt`. TikTok usa Inbox/Draft; o agendamento final é escolhido dentro do TikTok."
     )
 
 uploader_reset_nonce = int(st.session_state.get("uploader_reset_nonce", 0))
@@ -1242,7 +1190,7 @@ schedule_mode = st.selectbox(
     index=0,
     help=(
         "No YouTube/Shorts, o horário é enviado para a API como status.publishAt. "
-        "No TikTok, o app salva uma fila local e publica via Direct Post quando chegar o horário."
+        "No TikTok, o app usa somente Inbox/Draft: envia o vídeo para a caixa de entrada do TikTok, e você finaliza ou agenda no fluxo nativo."
     ),
     key="global_schedule_mode",
 )

@@ -11,7 +11,7 @@ from typing import Any, Callable
 from zoneinfo import ZoneInfo
 
 from .config import DEFAULT_TIMEZONE, SCHEDULE_FILE, TIKTOK_QUEUE_POLL_SECONDS, TIKTOK_SCHEDULER_ENABLED
-from .tiktok_upload import fetch_tiktok_publish_status, upload_video_to_tiktok_direct, upload_video_to_tiktok_inbox
+from .tiktok_upload import fetch_tiktok_publish_status, upload_video_to_tiktok_inbox
 from .utils import read_json, write_json
 from .youtube_upload import upload_video
 
@@ -299,25 +299,12 @@ def _publish_item(item: dict[str, Any], progress_callback: Callable[[float, str]
         )
 
     if platform == "tiktok":
-        mode = item.get("tiktok_mode", "direct_post")
-        if mode == "inbox_upload":
-            return upload_video_to_tiktok_inbox(
-                video_path=Path(item["video_path"]),
-                access_token=item.get("access_token") or None,
-                progress_callback=progress_callback,
-            )
-        return upload_video_to_tiktok_direct(
+        # TikTok fica restrito ao fluxo Inbox/Draft. Mesmo que exista um item antigo
+        # marcado como direct_post na fila, esta versão envia apenas para Inbox/Draft.
+        return upload_video_to_tiktok_inbox(
             video_path=Path(item["video_path"]),
-            caption=item.get("caption", ""),
-            privacy_level=item.get("privacy_level", "SELF_ONLY"),
-            disable_duet=bool(item.get("disable_duet", False)),
-            disable_stitch=bool(item.get("disable_stitch", False)),
-            disable_comment=bool(item.get("disable_comment", False)),
-            video_cover_timestamp_ms=int(item.get("video_cover_timestamp_ms", 1000)),
-            brand_content_toggle=bool(item.get("brand_content_toggle", False)),
-            brand_organic_toggle=bool(item.get("brand_organic_toggle", False)),
-            is_aigc=bool(item.get("is_aigc", False)),
             access_token=item.get("access_token") or None,
+            caption=str(item.get("caption") or ""),
             progress_callback=progress_callback,
         )
 

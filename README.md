@@ -30,7 +30,7 @@ App local em Streamlit para transformar uma música em um pacote pronto para You
 - Proteção opcional para publicar em Streamlit: login por senha (`APP_USERNAME`/`APP_PASSWORD`) e allowlist de IP/CIDR (`APP_ALLOWED_IPS`).
 - Campo visível de **data e hora de publicação** logo no início do fluxo, antes de gerar o pacote.
 - **Agendamento nativo no YouTube/Shorts**: ao escolher agendamento, o vídeo sobe agora como privado e libera automaticamente no horário escolhido usando `status.publishAt`.
-- **Agendamento TikTok por fila local**: quando há data/hora selecionada, a aba TikTok salva o post em `outputs/scheduled_posts.json` e um worker local publica via Direct Post no horário.
+- **TikTok somente por Inbox/Draft**: a aba TikTok envia o vídeo para a Inbox/Caixa de entrada do TikTok e deixa a legenda pronta para copiar/colar ao finalizar ou agendar pelo fluxo nativo do TikTok.
 
 > Importante: use apenas músicas, capas, thumbnails e letras que sejam suas, licenciadas ou autorizadas. O app otimiza metadados, mas não garante viralização.
 
@@ -66,7 +66,7 @@ youtube_music_ai_app_groq_lyrics/
 - FFmpeg instalado e disponível no PATH.
 - Uma chave da Groq API para gerar metadados por IA.
 - Para postar automaticamente no YouTube: projeto no Google Cloud com YouTube Data API habilitada e credenciais OAuth de app desktop.
-- Para postar no TikTok: app aprovado/ativo no TikTok for Developers e **User Access Token OAuth** com escopo `video.publish` para Direct Post ou `video.upload` para Inbox/Draft.
+- Para postar no TikTok: app aprovado/ativo no TikTok for Developers e **User Access Token OAuth** com escopo `video.upload` para Inbox/Draft.
 
 ## Limite automático para YouTube Shorts
 
@@ -191,7 +191,7 @@ Antes de rodar o script, configure no `.env`:
 TIKTOK_CLIENT_ID=sua_client_key_ou_client_id
 TIKTOK_CLIENT_SECRET=seu_client_secret
 TIKTOK_REDIRECT_URI=http://localhost:8000/callback
-TIKTOK_SCOPES=user.info.basic,video.publish,video.upload
+TIKTOK_SCOPES=user.info.basic,video.upload
 TIKTOK_DEFAULT_PRIVACY_LEVEL=SELF_ONLY
 ```
 
@@ -206,18 +206,13 @@ TIKTOK_TOKEN_FILE=credentials/.tiktok_token.json
 
 Na hora de postar, a ordem de busca é: token digitado na tela, `TIKTOK_ACCESS_TOKEN` do `.env`, `TIKTOK_TOKEN_FILE`, `credentials/.tiktok_token.json`, `credentials/tiktok_token.json` e `.tiktok_token.json`. Se houver `refresh_token` e credenciais do app, o backend tenta renovar o token automaticamente quando a API retornar erro de autenticação.
 
-Atenção: o **Client Key** do TikTok sozinho não posta vídeo. Ele é usado no OAuth/Login Kit para obter um **User Access Token** autorizado pelo usuário. Para publicação direta, o token precisa do escopo `video.publish`. Para enviar para Inbox/Draft, o token precisa do escopo `video.upload`.
+Atenção: o **Client Key** do TikTok sozinho não envia vídeo. Ele é usado no OAuth/Login Kit para obter um **User Access Token** autorizado pelo usuário. Nesta versão, o app usa somente `inbox_upload`, que envia o vídeo para Inbox/Draft usando `/v2/post/publish/inbox/video/init/`; depois você finaliza ou agenda dentro do TikTok.
 
-O app oferece dois modos:
-
-- `direct_post`: tenta publicar diretamente no TikTok usando `/v2/post/publish/video/init/`.
-- `inbox_upload`: envia o vídeo para Inbox/Draft usando `/v2/post/publish/inbox/video/init/`; depois você finaliza dentro do app TikTok.
-
-Apps TikTok ainda não auditados podem ficar restritos a posts privados. Por segurança, o padrão é `SELF_ONLY`.
+A Content Posting API de Inbox/Draft aceita o upload do arquivo, mas não aceita caption/descrição no payload desse endpoint. Por isso, se o TikTok mostrar uma hashtag padrão do app, como `#tiktokuploadtest`, substitua pela legenda gerada pela IA que o app exibe e disponibiliza para download.
 
 ### Consulta de status do TikTok
 
-Depois de enviar para `direct_post` ou `inbox_upload`, o app salva o último `publish_id` na sessão e consulta o endpoint `/v2/post/publish/status/fetch/`. Isso ajuda a diferenciar:
+Depois de enviar para `inbox_upload`, o app salva o último `publish_id` na sessão e consulta o endpoint `/v2/post/publish/status/fetch/`. Isso ajuda a diferenciar:
 
 - `PROCESSING_UPLOAD`: o TikTok ainda está processando o arquivo;
 - `SEND_TO_USER_INBOX`: a notificação foi enviada para a Inbox/Caixa de entrada da conta que autorizou o token;
@@ -226,140 +221,19 @@ Depois de enviar para `direct_post` ou `inbox_upload`, o app salva o último `pu
 
 Se o envio para Inbox/Draft retornar sucesso, mas nada aparecer para você, abra o TikTok no celular na mesma conta que autorizou o OAuth, vá em **Inbox/Caixa de entrada/Notificações** e procure a notificação do upload. Se o status ficar `PROCESSING_UPLOAD`, aguarde e clique em **Consultar status desse publish_id no TikTok**. Se vier `FAILED`, leia o `fail_reason` exibido pelo app.
 
-### Agendamento automático no TikTok por fila local
+### TikTok Inbox/Draft e legenda
 
-A API oficial de Direct Post do TikTok não possui campo `publishAt` ou `schedule_time` no corpo do endpoint de postagem direta. Por isso o app faz o agendamento no próprio sistema:
+A aba TikTok usa apenas o envio oficial para Inbox/Draft. Quando houver data/hora escolhida na etapa de agendamento, ela serve como referência visual: o agendamento real deve ser concluído dentro do TikTok, após abrir a notificação da Inbox/Draft.
 
-1. você escolhe data e hora na etapa **2. Agendamento de publicação**;
-2. gera o pacote normalmente;
-3. entra na seção **TikTok**;
-4. deixa o modo como `direct_post`;
-5. clica em **Agendar publicação automática via fila**.
+Fluxo recomendado:
 
-O item fica salvo em:
-
-```text
-outputs/scheduled_posts.json
-```
-
-O worker local acorda a cada `TIKTOK_QUEUE_POLL_SECONDS` e, quando chegar o horário, chama o Direct Post do TikTok. Esse fluxo não usa celular e não passa por Inbox/Draft.
-
-Requisitos para funcionar:
-
-- token TikTok persistido no `.env` ou em `credentials/.tiktok_token.json`;
-- escopo OAuth `video.publish`;
-- app/servidor rodando no horário agendado;
-- `TIKTOK_SCHEDULER_ENABLED=true`.
-
-Por segurança, o token digitado manualmente na tela não é gravado na fila. Para agendamento, salve o token pelo `tiktok_oauth_setup.py` ou pelas variáveis do ambiente.
-
-Se o Streamlit/servidor estiver dormindo ou desligado no horário, a publicação será processada quando o app voltar a rodar. Para agendamento crítico, prefira VPS/servidor sempre ligado ou um serviço que mantenha o app acordado.
-
-Você ainda pode usar **Enviar para Inbox/Draft agora** quando quiser finalizar manualmente dentro do TikTok.
-
-## Segurança para publicar o app
-
-Antes de publicar em uma URL pública, configure autenticação no `.env` ou no painel de Secrets do Streamlit Cloud:
-
-```env
-APP_AUTH_ENABLED=true
-APP_USERNAME=admin
-APP_PASSWORD=troque-por-uma-senha-forte
-```
-
-Para tentar limitar ao seu IP:
-
-```env
-APP_ALLOWED_IPS=189.120.78.7
-APP_IP_STRICT=true
-```
-
-O app tenta detectar o IP por headers como `CF-Connecting-IP`, `True-Client-IP`, `X-Real-IP` e `X-Forwarded-For`. Em alguns hosts/proxies, o IP real pode não chegar até o Streamlit. Se você ficar bloqueado no Streamlit Cloud, altere para:
-
-```env
-APP_IP_STRICT=false
-```
-
-Nesse modo, o app continua exigindo senha forte, mas não bloqueia quando o host não expõe o IP real de forma confiável.
-
-## Publicação no Streamlit Community Cloud
-
-Arquivos importantes para subir no GitHub:
-
-- `app.py`
-- `requirements.txt`
-- `packages.txt` com `ffmpeg`
-- pasta `core/`
-- `.env.example` apenas como referência
-
-Não suba `.env`, `credentials/*.json`, `outputs/` nem `uploads/`. Configure os valores sensíveis no painel de Secrets do Streamlit Cloud.
-
-Exemplo de Secrets para o deploy:
-
-```toml
-GROQ_API_KEY = "sua-chave"
-TIKTOK_CLIENT_ID = "sua-client-key"
-TIKTOK_CLIENT_SECRET = "seu-client-secret"
-TIKTOK_ACCESS_TOKEN = "token-oauth"
-TIKTOK_REFRESH_TOKEN = "refresh-token"
-TIKTOK_TOKEN_FILE = "credentials/.tiktok_token.json"
-TIKTOK_SCOPES = "user.info.basic,video.publish,video.upload"
-TIKTOK_SCHEDULER_ENABLED = "true"
-TIKTOK_QUEUE_POLL_SECONDS = "60"
-
-APP_AUTH_ENABLED = "true"
-APP_USERNAME = "admin"
-APP_PASSWORD = "troque-por-uma-senha-forte"
-APP_ALLOWED_IPS = "189.120.78.7"
-APP_IP_STRICT = "true"
-DEFAULT_TIMEZONE = "America/Sao_Paulo"
-```
-
-Se o bloqueio por IP impedir seu acesso por causa de proxy/CDN, troque `APP_IP_STRICT` para `false` e mantenha senha forte.
-
-Observação importante: a fila TikTok roda dentro do processo Streamlit. Em servidor que dorme quando não há uso, o agendamento pode atrasar até o app acordar novamente. Para publicações críticas, hospede em um ambiente que fique sempre ligado.
-
-## Como rodar no Windows
-
-```powershell
-cd youtube_music_ai_app_groq_lyrics
-copy .env.example .env
-notepad .env
-run_windows.bat
-```
-
-Depois abra o endereço mostrado pelo Streamlit, normalmente:
-
-```text
-http://localhost:8501
-```
-
-## Como rodar no macOS/Linux
-
-```bash
-cd youtube_music_ai_app_groq_lyrics
-cp .env.example .env
-nano .env
-./run_mac_linux.sh
-```
-
-## Como usar
-
-1. Envie o áudio da música.
-2. Envie pelo menos uma imagem:
-   - imagem 16:9 para vídeo normal do YouTube;
-   - imagem 9:16 para Shorts/TikTok;
-   - ou as duas.
-3. Opcionalmente, envie uma thumbnail pronta.
-4. Escolha se quer publicar imediatamente ou agendar data/hora na etapa **2. Agendamento de publicação**.
-5. Preencha nome da música, nome do artista, vibe e idioma.
-6. Cole a letra da música ou envie um `.txt`.
-7. Clique em **Gerar pacote conforme imagens enviadas**.
-8. Revise os vídeos e os metadados nas abas geradas:
-   - YouTube 16:9, se a imagem 16:9 foi enviada;
-   - YouTube Shorts e TikTok, se a imagem 9:16 foi enviada;
-   - Prompts de imagem.
-9. Publique agora ou use o agendamento. Para TikTok agendado, use `direct_post` e clique em **Agendar publicação automática via fila**.
+1. gere o pacote;
+2. entre na seção **TikTok**;
+3. revise a legenda gerada pela IA;
+4. clique em **Enviar para TikTok Inbox/Draft**;
+5. abra a notificação no TikTok;
+6. substitua qualquer hashtag padrão do app pela legenda pronta;
+7. finalize ou agende pelo TikTok.
 
 ## Saída gerada
 
@@ -413,7 +287,7 @@ TIKTOK_DEFAULT_PRIVACY_LEVEL=SELF_ONLY
 TIKTOK_CLIENT_ID=
 TIKTOK_CLIENT_SECRET=
 TIKTOK_REDIRECT_URI=http://localhost:8000/callback
-TIKTOK_SCOPES=user.info.basic,video.publish,video.upload
+TIKTOK_SCOPES=user.info.basic,video.upload
 TIKTOK_SCHEDULER_ENABLED=true
 TIKTOK_QUEUE_POLL_SECONDS=60
 
@@ -445,7 +319,7 @@ A versão atual inclui uma central de status no topo do app para acompanhar cada
 - erro bruto quando o TikTok recusar o upload, o token estiver sem escopo ou o arquivo local tiver sido apagado;
 - ações rápidas para processar vencidos agora, atualizar status, publicar imediatamente, tentar novamente, cancelar e remover itens antigos da lista.
 
-Importante: Direct Post do TikTok não deve ser considerado publicado no momento em que o upload termina. O app agora marca o item como `submitted` / `Aguardando TikTok` e só muda para confirmado quando o status do TikTok retorna `PUBLISH_COMPLETE` ou `SEND_TO_USER_INBOX`. Se retornar `FAILED`, o item fica como erro com o motivo retornado pela plataforma.
+Importante: no Inbox/Draft, o upload aceito ainda precisa ser finalizado no TikTok. O app registra o `publish_id`, consulta status e considera confirmado quando o TikTok retorna `SEND_TO_USER_INBOX` ou outro status final de sucesso. Se retornar `FAILED`, o item fica como erro com o motivo retornado pela plataforma.
 
 ## Streamlit Cloud e agendamentos TikTok
 

@@ -243,7 +243,7 @@ def _resolve_token(access_token: str | None = None, *, refresh_if_needed: bool =
         "TikTok access token não configurado. O app procurou por: campo da tela, "
         "TIKTOK_ACCESS_TOKEN no .env, TIKTOK_TOKEN_FILE, credentials/.tiktok_token.json, "
         "credentials/tiktok_token.json e .tiktok_token.json. Rode `python tiktok_oauth_setup.py` "
-        "para gerar um token com video.publish e/ou video.upload."
+        "para gerar um token com video.upload."
     )
 
 
@@ -379,7 +379,7 @@ def _upload_file_chunks(
 
 
 def fetch_tiktok_publish_status(publish_id: str, access_token: str | None = None) -> dict[str, Any]:
-    """Consulta o status de um publish_id gerado pelo Direct Post ou Inbox Upload.
+    """Consulta o status de um publish_id gerado pelo Inbox Upload.
 
     Retorna o objeto `data` da API quando disponível. Status importantes:
     PROCESSING_UPLOAD, SEND_TO_USER_INBOX, PUBLISH_COMPLETE e FAILED.
@@ -481,6 +481,7 @@ def upload_video_to_tiktok_direct(
 def upload_video_to_tiktok_inbox(
     video_path: Path,
     access_token: str | None = None,
+    caption: str | None = None,
     progress_callback: Callable[[float, str], None] | None = None,
 ) -> dict[str, Any]:
     """Envia vídeo para Inbox/Draft do TikTok para finalizar/agendar dentro do TikTok.
@@ -526,6 +527,12 @@ def upload_video_to_tiktok_inbox(
         "mode": "inbox_upload",
         "chunk_size": chunk_size,
         "total_chunk_count": total_chunk_count,
+        "caption": (caption or "")[:2200],
+        "caption_delivery": "manual_copy_required_by_tiktok_inbox_api",
+        "caption_note": (
+            "A Content Posting API de Inbox/Draft aceita apenas source_info no init; "
+            "a legenda deve ser revisada/colada no TikTok ao concluir o post."
+        ),
     }
 
 
